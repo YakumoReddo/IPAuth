@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import html
 import urllib.parse
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -82,6 +83,18 @@ def _cookie_header(token: str) -> str:
         f"{settings.cookie_name}={token}; Path=/; HttpOnly; SameSite=Lax; "
         f"Max-Age={settings.cookie_max_age}"
     )
+
+
+def _safe_next(next_value: str | None) -> str:
+    """校验 next 参数，避免开放重定向。"""
+    if not next_value:
+        return "/"
+    candidate = urllib.parse.unquote(next_value).strip()
+    if not candidate.startswith("/"):
+        return "/"
+    if candidate.startswith("//"):
+        return "/"
+    return candidate
 
 
 def _lookup_session(conn, token: str):
@@ -178,6 +191,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
+        if path == "/auth/login":
+            return self._login_page(parsed.query)
+
         if path == "/auth/health":
             return _json(self, 200, {"status": "ok"})
 
@@ -207,6 +223,101 @@ class Handler(BaseHTTPRequestHandler):
             return self._create_user()
 
         return _json(self, 404, {"error": "not found"})
+
+    def _login_page(self, query: str):
+        """返回内置登录页，提交到 POST /auth/login。"""
+        next_value = _safe_next(urllib.parse.parse_qs(query).get("next", ["/"])[0])
+        next_escaped = html.escape(next_value, quote=True)
+        page = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IPAuth 登录</title>
+  <style>
+    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f7fb;margin:0;padding:24px;color:#1b2430}}
+    .card{{max-width:560px;margin:0 auto;background:#fff;border:1px solid #dfe5ef;border-radius:12px;padding:20px}}
+    h1{{margin:0 0 16px;font-size:22px}}
+    label{{display:block;margin:10px 0 6px;font-size:14px}}
+    input,select{{width:100%;padding:10px;border:1px solid #c8d2e1;border-radius:8px;box-sizing:border-box}}
+    button{{margin-top:14px;width:100%;padding:11px;border:0;border-radius:8px;background:#0f62fe;color:#fff;font-size:15px;cursor:pointer}}
+    .tip{{font-size:12px;color:#5a677d;margin-top:10px}}
+    .err{{margin-top:10px;color:#c62828;font-size:13px;white-space:pre-wrap}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>登录认证</h1>
+    <form id="loginForm">
+      <label>用户名</label>
+      <input name="username" required>
+      <label>密码（可选，按挑战类型）</label>
+      <input type="password" name="password">
+      <label>TOTP（可选，按挑战类型）</label>
+      <input name="totp" inputmode="numeric" pattern="\\d{{6}}" maxlength="6">
+      <label>挑战类型</label>
+      <select name="challenge">
+        <option value="both">both（密码+TOTP）</option>
+        <option value="one_of">one_of（密码或TOTP）</option>
+      </select>
+      <label>地点 ID（已有地点优先）</label>
+      <input name="location_id" inputmode="numeric">
+      <label>新地点名称（无地点ID时使用）</label>
+      <input name="location_name" placeholder="例如 home">
+      <label>是否公共场所（新地点生效）</label>
+      <select name="is_public">
+        <option value="false">否</option>
+        <option value="true">是</option>
+      </select>
+      <button type="submit">登录</button>
+    </form>
+    <div class="tip">登录成功后将跳转到：<code>{next_escaped}</code></div>
+    <div id="err" class="err"></div>
+  </div>
+  <script>
+    const nextUrl = {json.dumps(next_value)};
+    const form = document.getElementById("loginForm");
+    const errEl = document.getElementById("err");
+    form.addEventListener("submit", async (e) => {{
+      e.preventDefault();
+      errEl.textContent = "";
+      const fd = new FormData(form);
+      const payload = {{
+        username: (fd.get("username") || "").toString().trim(),
+        password: (fd.get("password") || "").toString(),
+        totp: (fd.get("totp") || "").toString().trim(),
+        challenge: (fd.get("challenge") || "both").toString(),
+        location_name: (fd.get("location_name") || "").toString().trim(),
+        is_public: (fd.get("is_public") || "false").toString() === "true"
+      }};
+      const locationIdRaw = (fd.get("location_id") || "").toString().trim();
+      if (locationIdRaw) payload.location_id = Number(locationIdRaw);
+      try {{
+        const resp = await fetch("/auth/login", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(payload),
+          credentials: "same-origin"
+        }});
+        const data = await resp.json().catch(() => ({{}}));
+        if (!resp.ok) {{
+          errEl.textContent = data.error || "登录失败";
+          return;
+        }}
+        window.location.href = nextUrl || "/";
+      }} catch (_) {{
+        errEl.textContent = "网络错误，请稍后重试";
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+        body = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _auth_check(self, query: str):
         """鉴权入口：给 Nginx auth_request 调用。"""

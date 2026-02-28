@@ -28,6 +28,7 @@ curl -X POST http://127.0.0.1:8080/auth/admin/users ^
 
 ## 核心接口
 - `GET /auth/health`
+- `GET /auth/login`（内置登录页）
 - `GET /auth/check`
 - `POST /auth/login`
 - `GET /auth/locations`
