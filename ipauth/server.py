@@ -111,6 +111,45 @@ def _lookup_session(conn, token: str):
     ).fetchone()
 
 
+def _get_cookie_context_for_user(conn, token: str | None, user_id: int, ip: str) -> tuple[str, bool, bool]:
+    """根据用户、Cookie 与当前 IP 计算策略输入上下文。"""
+    cookie_status = "missing"
+    same_ip = False
+    is_public = False
+
+    if token:
+        sess = _lookup_session(conn, token)
+        if not sess:
+            cookie_status = "invalid"
+        elif int(sess["user_id"]) != user_id:
+            cookie_status = "invalid"
+        elif sess["expires_at"] <= now_ts():
+            cookie_status = "expired"
+            same_ip = sess["last_ip"] == ip
+            is_public = bool(sess["location_public"] == 1)
+        else:
+            cookie_status = "valid"
+            same_ip = sess["last_ip"] == ip
+            is_public = bool(sess["location_public"] == 1)
+        return cookie_status, same_ip, is_public
+
+    # 无 Cookie 时，用用户历史 IP 绑定判断是否“同 IP”场景。
+    binding = conn.execute(
+        """
+        SELECT b.location_id, l.is_public
+        FROM ip_location_bindings b
+        JOIN locations l ON l.id = b.location_id
+        WHERE b.user_id = ? AND b.ip = ?
+        """,
+        (user_id, ip),
+    ).fetchone()
+    if binding:
+        same_ip = True
+        is_public = bool(binding["is_public"] == 1)
+
+    return cookie_status, same_ip, is_public
+
+
 def _get_user_by_username(conn, username: str):
     """按用户名查询用户。"""
     return conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
@@ -151,6 +190,23 @@ def _create_or_select_location(conn, user_id: int, location_id, location_name: s
         return int(cur.lastrowid)
 
     return None
+
+
+def _current_locations(conn, user_id: int):
+    """返回用户地点列表。"""
+    rows = conn.execute(
+        "SELECT id, name, is_public, created_at FROM locations WHERE user_id = ? ORDER BY id DESC",
+        (user_id,),
+    ).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "name": r["name"],
+            "is_public": bool(r["is_public"]),
+            "created_at": int(r["created_at"]),
+        }
+        for r in rows
+    ]
 
 
 def _upsert_binding(conn, user_id: int, ip: str, location_id: int) -> None:
@@ -194,6 +250,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/auth/login":
             return self._login_page(parsed.query)
 
+        if path == "/auth/location":
+            return self._location_page(parsed.query)
+
         if path == "/auth/health":
             return _json(self, 200, {"status": "ok"})
 
@@ -205,6 +264,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/auth/bindings":
             return self._list_bindings()
+
+        if path == "/auth/session/context":
+            return self._session_context()
 
         return _json(self, 404, {"error": "not found"})
 
@@ -218,6 +280,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/auth/locations":
             return self._create_location()
+
+        if path == "/auth/location/select":
+            return self._select_location()
 
         if path == "/auth/admin/users":
             return self._create_user()
@@ -251,26 +316,13 @@ class Handler(BaseHTTPRequestHandler):
     <form id="loginForm">
       <label>用户名</label>
       <input name="username" required>
-      <label>密码（可选，按挑战类型）</label>
+      <label>密码</label>
       <input type="password" name="password">
-      <label>TOTP（可选，按挑战类型）</label>
+      <label>TOTP</label>
       <input name="totp" inputmode="numeric" pattern="\\d{{6}}" maxlength="6">
-      <label>挑战类型</label>
-      <select name="challenge">
-        <option value="both">both（密码+TOTP）</option>
-        <option value="one_of">one_of（密码或TOTP）</option>
-      </select>
-      <label>地点 ID（已有地点优先）</label>
-      <input name="location_id" inputmode="numeric">
-      <label>新地点名称（无地点ID时使用）</label>
-      <input name="location_name" placeholder="例如 home">
-      <label>是否公共场所（新地点生效）</label>
-      <select name="is_public">
-        <option value="false">否</option>
-        <option value="true">是</option>
-      </select>
       <button type="submit">登录</button>
     </form>
+    <div class="tip">挑战规则由服务端策略自动判定，不可手动选择。</div>
     <div class="tip">登录成功后将跳转到：<code>{next_escaped}</code></div>
     <div id="err" class="err"></div>
   </div>
@@ -278,6 +330,33 @@ class Handler(BaseHTTPRequestHandler):
     const nextUrl = {json.dumps(next_value)};
     const form = document.getElementById("loginForm");
     const errEl = document.getElementById("err");
+    const passwordInput = form.querySelector("input[name='password']");
+    const totpInput = form.querySelector("input[name='totp']");
+
+    async function syncChallengeHint() {{
+      try {{
+        const ctxResp = await fetch("/auth/session/context", {{ credentials: "same-origin" }});
+        if (ctxResp.ok) {{
+          window.location.href = "/auth/location?next=" + encodeURIComponent(nextUrl || "/");
+          return;
+        }}
+        const resp = await fetch("/auth/check", {{ credentials: "same-origin" }});
+        const data = await resp.json().catch(() => ({{}}));
+        if (!resp.ok) {{
+          if (data.challenge === "both") {{
+            passwordInput.required = true;
+            totpInput.required = true;
+          }} else {{
+            passwordInput.required = false;
+            totpInput.required = false;
+          }}
+        }}
+      }} catch (_) {{
+        // 仅用于增强提示，失败不阻塞登录。
+      }}
+    }}
+    syncChallengeHint();
+
     form.addEventListener("submit", async (e) => {{
       e.preventDefault();
       errEl.textContent = "";
@@ -285,13 +364,8 @@ class Handler(BaseHTTPRequestHandler):
       const payload = {{
         username: (fd.get("username") || "").toString().trim(),
         password: (fd.get("password") || "").toString(),
-        totp: (fd.get("totp") || "").toString().trim(),
-        challenge: (fd.get("challenge") || "both").toString(),
-        location_name: (fd.get("location_name") || "").toString().trim(),
-        is_public: (fd.get("is_public") || "false").toString() === "true"
+        totp: (fd.get("totp") || "").toString().trim()
       }};
-      const locationIdRaw = (fd.get("location_id") || "").toString().trim();
-      if (locationIdRaw) payload.location_id = Number(locationIdRaw);
       try {{
         const resp = await fetch("/auth/login", {{
           method: "POST",
@@ -304,10 +378,109 @@ class Handler(BaseHTTPRequestHandler):
           errEl.textContent = data.error || "登录失败";
           return;
         }}
-        window.location.href = nextUrl || "/";
+        window.location.href = "/auth/location?next=" + encodeURIComponent(nextUrl || "/");
       }} catch (_) {{
         errEl.textContent = "网络错误，请稍后重试";
       }}
+    }});
+  </script>
+</body>
+</html>"""
+        body = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _location_page(self, query: str):
+        """登录后地点选择页。"""
+        next_value = _safe_next(urllib.parse.parse_qs(query).get("next", ["/"])[0])
+        next_escaped = html.escape(next_value, quote=True)
+        page = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>选择登录地点</title>
+  <style>
+    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f7fb;margin:0;padding:24px;color:#1b2430}}
+    .card{{max-width:560px;margin:0 auto;background:#fff;border:1px solid #dfe5ef;border-radius:12px;padding:20px}}
+    h1{{margin:0 0 16px;font-size:22px}}
+    label{{display:block;margin:10px 0 6px;font-size:14px}}
+    input,select{{width:100%;padding:10px;border:1px solid #c8d2e1;border-radius:8px;box-sizing:border-box}}
+    button{{margin-top:14px;width:100%;padding:11px;border:0;border-radius:8px;background:#0f62fe;color:#fff;font-size:15px;cursor:pointer}}
+    .tip{{font-size:12px;color:#5a677d;margin-top:10px}}
+    .err{{margin-top:10px;color:#c62828;font-size:13px;white-space:pre-wrap}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>选择登录地点</h1>
+    <form id="locationForm">
+      <label>已存在地点</label>
+      <select name="location_id" id="locationSelect">
+        <option value="">-- 不使用已有地点，改为新建 --</option>
+      </select>
+      <label>新地点名称（未选择已有地点时必填）</label>
+      <input name="location_name" placeholder="例如 home">
+      <label>是否公共场所（新地点生效）</label>
+      <select name="is_public">
+        <option value="false">否</option>
+        <option value="true">是</option>
+      </select>
+      <button type="submit">确认并进入</button>
+    </form>
+    <div class="tip" id="ipTip">当前 IP：加载中...</div>
+    <div class="tip">确认后将跳转到：<code>{next_escaped}</code></div>
+    <div id="err" class="err"></div>
+  </div>
+  <script>
+    const nextUrl = {json.dumps(next_value)};
+    const errEl = document.getElementById("err");
+    const selectEl = document.getElementById("locationSelect");
+    const ipTip = document.getElementById("ipTip");
+
+    async function loadContext() {{
+      const resp = await fetch("/auth/session/context", {{ credentials: "same-origin" }});
+      const data = await resp.json().catch(() => ({{}}));
+      if (!resp.ok) {{
+        window.location.href = "/auth/login?next=" + encodeURIComponent(nextUrl || "/");
+        return;
+      }}
+      ipTip.textContent = "当前 IP：" + (data.ip || "unknown");
+      (data.locations || []).forEach(item => {{
+        const opt = document.createElement("option");
+        opt.value = String(item.id);
+        opt.textContent = item.name + (item.is_public ? "（公共）" : "");
+        selectEl.appendChild(opt);
+      }});
+    }}
+    loadContext();
+
+    document.getElementById("locationForm").addEventListener("submit", async (e) => {{
+      e.preventDefault();
+      errEl.textContent = "";
+      const fd = new FormData(e.target);
+      const payload = {{
+        location_name: (fd.get("location_name") || "").toString().trim(),
+        is_public: (fd.get("is_public") || "false").toString() === "true"
+      }};
+      const locationIdRaw = (fd.get("location_id") || "").toString().trim();
+      if (locationIdRaw) payload.location_id = Number(locationIdRaw);
+
+      const resp = await fetch("/auth/location/select", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(payload),
+        credentials: "same-origin"
+      }});
+      const data = await resp.json().catch(() => ({{}}));
+      if (!resp.ok) {{
+        errEl.textContent = data.error || "提交失败";
+        return;
+      }}
+      window.location.href = nextUrl || "/";
     }});
   </script>
 </body>
@@ -345,6 +518,29 @@ class Handler(BaseHTTPRequestHandler):
 
             user_id = sess["user_id"] if sess else None
             location_id = sess["last_location_id"] if sess else None
+
+            # 登录后未完成地点选择时，不允许进入受保护资源。
+            if cookie_status == "valid" and sess and sess["last_location_id"] is None:
+                _write_log(
+                    conn,
+                    user_id,
+                    ip,
+                    None,
+                    site_id,
+                    "SETUP_REQUIRED",
+                    "location",
+                    "challenge",
+                    "location not selected",
+                )
+                return _json(
+                    self,
+                    401,
+                    {
+                        "decision": "SETUP_REQUIRED",
+                        "challenge": "location",
+                        "require_location_rebind": False,
+                    },
+                )
 
             if decision.decision == "ALLOW":
                 _write_log(
@@ -391,44 +587,32 @@ class Handler(BaseHTTPRequestHandler):
         username = (payload.get("username") or "").strip()
         password = payload.get("password")
         totp_code = payload.get("totp")
-        challenge = payload.get("challenge", "both")
-        location_id = payload.get("location_id")
-        location_name = payload.get("location_name")
-        is_public = bool(payload.get("is_public", False))
-
-        if challenge not in {"one_of", "both"}:
-            return _json(self, 400, {"error": "challenge must be one_of or both"})
 
         if not username:
             return _json(self, 400, {"error": "username required"})
 
         ip = _client_ip(self)
+        token = _read_cookie_token(self)
 
         with get_conn(settings.db_path) as conn:
             user = _get_user_by_username(conn, username)
             if not user:
                 return _json(self, 401, {"error": "invalid credentials"})
 
+            cookie_status, same_ip, is_public = _get_cookie_context_for_user(conn, token, int(user["id"]), ip)
+            policy = evaluate_policy(same_ip=same_ip, cookie_status=cookie_status, is_public_location=is_public)
+            required_challenge = policy.challenge_type or "one_of"
+
             pass_ok = bool(password) and verify_password(str(password), user["password_hash"])
             totp_ok = bool(totp_code) and verify_totp(str(totp_code), user["totp_secret"])
 
             # 两种挑战模式：both 需双因子，one_of 任一通过即可。
-            if challenge == "both":
+            if required_challenge == "both":
                 if not (pass_ok and totp_ok):
                     return _json(self, 401, {"error": "password and totp required"})
             else:
                 if not (pass_ok or totp_ok):
                     return _json(self, 401, {"error": "password or totp required"})
-
-            chosen_location_id = _create_or_select_location(
-                conn,
-                user_id=int(user["id"]),
-                location_id=location_id,
-                location_name=location_name,
-                is_public=is_public,
-            )
-            if not chosen_location_id:
-                return _json(self, 400, {"error": "location_id or location_name required"})
 
             token = new_session_token()
             now = now_ts()
@@ -444,19 +628,18 @@ class Handler(BaseHTTPRequestHandler):
                     now,
                     expires,
                     ip,
-                    chosen_location_id,
+                    None,
                     "active",
                 ),
             )
-            _upsert_binding(conn, int(user["id"]), ip, chosen_location_id)
             _write_log(
                 conn,
                 int(user["id"]),
                 ip,
-                chosen_location_id,
+                None,
                 payload.get("site_id"),
                 "LOGIN",
-                challenge,
+                required_challenge,
                 "success",
                 "login success",
             )
@@ -467,10 +650,71 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "message": "login success",
                     "user_id": int(user["id"]),
-                    "location_id": chosen_location_id,
+                    "next_step": "select_location",
                 },
                 headers={"Set-Cookie": _cookie_header(token)},
             )
+
+    def _session_context(self):
+        """返回登录后地点选择所需上下文。"""
+        auth, err = _require_user(self)
+        if err:
+            return _json(self, 401, {"error": "unauthorized", "reason": err})
+
+        with get_conn(settings.db_path) as conn:
+            return _json(
+                self,
+                200,
+                {
+                    "ip": _client_ip(self),
+                    "locations": _current_locations(conn, int(auth["user"]["id"])),
+                },
+            )
+
+    def _select_location(self):
+        """登录后选择或创建地点，并绑定当前 IP。"""
+        auth, err = _require_user(self)
+        if err:
+            return _json(self, 401, {"error": "unauthorized", "reason": err})
+
+        try:
+            payload = _parse_json(self)
+        except Exception:
+            return _json(self, 400, {"error": "invalid json"})
+
+        location_id = payload.get("location_id")
+        location_name = (payload.get("location_name") or "").strip()
+        is_public = bool(payload.get("is_public", False))
+        ip = _client_ip(self)
+
+        with get_conn(settings.db_path) as conn:
+            chosen_location_id = _create_or_select_location(
+                conn,
+                user_id=int(auth["user"]["id"]),
+                location_id=location_id,
+                location_name=location_name,
+                is_public=is_public,
+            )
+            if not chosen_location_id:
+                return _json(self, 400, {"error": "location_id or location_name required"})
+
+            conn.execute(
+                "UPDATE sessions SET last_location_id = ?, last_ip = ? WHERE id = ?",
+                (chosen_location_id, ip, int(auth["session"]["id"])),
+            )
+            _upsert_binding(conn, int(auth["user"]["id"]), ip, chosen_location_id)
+            _write_log(
+                conn,
+                int(auth["user"]["id"]),
+                ip,
+                chosen_location_id,
+                None,
+                "LOCATION_SELECT",
+                None,
+                "success",
+                "location confirmed",
+            )
+            return _json(self, 200, {"message": "location selected", "location_id": chosen_location_id})
 
     def _list_locations(self):
         """列出当前用户的地点。"""

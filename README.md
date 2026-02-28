@@ -29,11 +29,18 @@ curl -X POST http://127.0.0.1:8080/auth/admin/users ^
 ## 核心接口
 - `GET /auth/health`
 - `GET /auth/login`（内置登录页）
+- `GET /auth/location`（登录后地点选择页）
 - `GET /auth/check`
 - `POST /auth/login`
+- `GET /auth/session/context`
+- `POST /auth/location/select`
 - `GET /auth/locations`
 - `POST /auth/locations`
 - `GET /auth/bindings`
+
+说明：
+- 挑战类型由后端策略自动判定，前端不允许手动选择 `both/one_of`。
+- 地点选择从登录流程中拆分，改为登录成功后单独完成。
 
 ## 登录示例
 ```powershell
