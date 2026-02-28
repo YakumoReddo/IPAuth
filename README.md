@@ -32,6 +32,7 @@ curl -X POST http://127.0.0.1:8080/auth/admin/users ^
 - `GET /auth/location`（登录后地点选择页）
 - `GET /auth/check`
 - `POST /auth/login`
+- `POST /auth/login/requirements`
 - `GET /auth/session/context`
 - `POST /auth/location/select`
 - `GET /auth/locations`
@@ -46,7 +47,14 @@ curl -X POST http://127.0.0.1:8080/auth/admin/users ^
 ```powershell
 curl -i -X POST http://127.0.0.1:8080/auth/login ^
   -H "Content-Type: application/json" ^
-  -d "{\"username\":\"alice\",\"password\":\"Passw0rd!\",\"totp\":\"123456\",\"challenge\":\"both\",\"location_name\":\"home\",\"is_public\":false}"
+  -d "{\"username\":\"alice\",\"password\":\"Passw0rd!\",\"totp\":\"123456\"}"
+```
+
+登录成功后，再调用地点确认：
+```powershell
+curl -i -X POST http://127.0.0.1:8080/auth/location/select ^
+  -H "Content-Type: application/json" ^
+  -d "{\"location_name\":\"home\",\"is_public\":false}"
 ```
 
 ## Nginx 对接（示意）

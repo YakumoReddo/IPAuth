@@ -284,6 +284,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/auth/location/select":
             return self._select_location()
 
+        if path == "/auth/login/requirements":
+            return self._login_requirements()
+
         if path == "/auth/admin/users":
             return self._create_user()
 
@@ -330,8 +333,22 @@ class Handler(BaseHTTPRequestHandler):
     const nextUrl = {json.dumps(next_value)};
     const form = document.getElementById("loginForm");
     const errEl = document.getElementById("err");
+    const usernameInput = form.querySelector("input[name='username']");
     const passwordInput = form.querySelector("input[name='password']");
     const totpInput = form.querySelector("input[name='totp']");
+    const tipEl = document.querySelector(".tip");
+
+    function applyChallenge(challenge) {{
+      if (challenge === "both") {{
+        passwordInput.required = true;
+        totpInput.required = true;
+        tipEl.textContent = "当前策略：需要同时输入密码和 TOTP。";
+      }} else {{
+        passwordInput.required = false;
+        totpInput.required = false;
+        tipEl.textContent = "当前策略：密码或 TOTP 二选一。";
+      }}
+    }}
 
     async function syncChallengeHint() {{
       try {{
@@ -340,22 +357,30 @@ class Handler(BaseHTTPRequestHandler):
           window.location.href = "/auth/location?next=" + encodeURIComponent(nextUrl || "/");
           return;
         }}
-        const resp = await fetch("/auth/check", {{ credentials: "same-origin" }});
+        const username = (usernameInput.value || "").trim();
+        if (!username) {{
+          applyChallenge("one_of");
+          return;
+        }}
+        const resp = await fetch("/auth/login/requirements", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ username }}),
+          credentials: "same-origin"
+        }});
         const data = await resp.json().catch(() => ({{}}));
-        if (!resp.ok) {{
-          if (data.challenge === "both") {{
-            passwordInput.required = true;
-            totpInput.required = true;
-          }} else {{
-            passwordInput.required = false;
-            totpInput.required = false;
-          }}
+        if (resp.ok) {{
+          applyChallenge(data.challenge || "one_of");
+        }} else {{
+          applyChallenge("both");
         }}
       }} catch (_) {{
-        // 仅用于增强提示，失败不阻塞登录。
+        applyChallenge("one_of");
       }}
     }}
     syncChallengeHint();
+    usernameInput.addEventListener("blur", syncChallengeHint);
+    usernameInput.addEventListener("change", syncChallengeHint);
 
     form.addEventListener("submit", async (e) => {{
       e.preventDefault();
@@ -422,13 +447,15 @@ class Handler(BaseHTTPRequestHandler):
       <select name="location_id" id="locationSelect">
         <option value="">-- 不使用已有地点，改为新建 --</option>
       </select>
-      <label>新地点名称（未选择已有地点时必填）</label>
-      <input name="location_name" placeholder="例如 home">
-      <label>是否公共场所（新地点生效）</label>
-      <select name="is_public">
-        <option value="false">否</option>
-        <option value="true">是</option>
-      </select>
+      <div id="newLocationBlock" style="display:none;">
+        <label>新地点名称（未选择已有地点时必填）</label>
+        <input name="location_name" id="newLocationName" placeholder="例如 home">
+        <label>是否公共场所（新地点生效）</label>
+        <select name="is_public">
+          <option value="false">否</option>
+          <option value="true">是</option>
+        </select>
+      </div>
       <button type="submit">确认并进入</button>
     </form>
     <div class="tip" id="ipTip">当前 IP：加载中...</div>
@@ -440,6 +467,16 @@ class Handler(BaseHTTPRequestHandler):
     const errEl = document.getElementById("err");
     const selectEl = document.getElementById("locationSelect");
     const ipTip = document.getElementById("ipTip");
+    const newLocationBlock = document.getElementById("newLocationBlock");
+    const newLocationName = document.getElementById("newLocationName");
+
+    function syncLocationForm() {{
+      const isNew = !selectEl.value;
+      newLocationBlock.style.display = isNew ? "block" : "none";
+      newLocationName.required = isNew;
+    }}
+    selectEl.addEventListener("change", syncLocationForm);
+    syncLocationForm();
 
     async function loadContext() {{
       const resp = await fetch("/auth/session/context", {{ credentials: "same-origin" }});
@@ -668,6 +705,36 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ip": _client_ip(self),
                     "locations": _current_locations(conn, int(auth["user"]["id"])),
+                },
+            )
+
+    def _login_requirements(self):
+        """根据用户名、IP、Cookie 上下文返回当前挑战类型。"""
+        try:
+            payload = _parse_json(self)
+        except Exception:
+            return _json(self, 400, {"error": "invalid json"})
+
+        username = (payload.get("username") or "").strip()
+        if not username:
+            return _json(self, 400, {"error": "username required"})
+
+        ip = _client_ip(self)
+        token = _read_cookie_token(self)
+        with get_conn(settings.db_path) as conn:
+            user = _get_user_by_username(conn, username)
+            if not user:
+                # 用户不存在时按最严格方式提示。
+                return _json(self, 200, {"challenge": "both"})
+            cookie_status, same_ip, is_public = _get_cookie_context_for_user(conn, token, int(user["id"]), ip)
+            policy = evaluate_policy(same_ip=same_ip, cookie_status=cookie_status, is_public_location=is_public)
+            return _json(
+                self,
+                200,
+                {
+                    "challenge": policy.challenge_type or "one_of",
+                    "cookie_status": cookie_status,
+                    "same_ip": same_ip,
                 },
             )
 
